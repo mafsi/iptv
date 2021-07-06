@@ -1,173 +1,164 @@
-const helper = require('./helper')
+const { program } = require('commander')
+const blacklist = require('./blacklist')
+const parser = require('./parser')
+const utils = require('./utils')
+const axios = require('axios')
+const ProgressBar = require('progress')
+const https = require('https')
 
-const config = {
-  debug: process.env.npm_config_debug || false,
-  country: process.env.npm_config_country,
-  exclude: process.env.npm_config_exclude,
-  epg: process.env.npm_config_epg || false
-}
+program
+  .usage('[OPTIONS]...')
+  .option('-d, --debug', 'Debug mode')
+  .option('-r --resolution', 'Parse stream resolution')
+  .option('-c, --country <country>', 'Comma-separated list of country codes', '')
+  .option('-e, --exclude <exclude>', 'Comma-separated list of country codes to be excluded', '')
+  .option('--delay <delay>', 'Delay between parser requests', 1000)
+  .option('--timeout <timeout>', 'Set timeout for each request', 5000)
+  .parse(process.argv)
 
-let updated = 0
-let items = []
+const config = program.opts()
+
+const instance = axios.create({
+  timeout: config.timeout,
+  maxContentLength: 200000,
+  httpsAgent: new https.Agent({
+    rejectUnauthorized: false
+  })
+})
 
 async function main() {
-  console.log(`Parsing index...`)
-  const index = parseIndex()
+  console.info('Starting...')
+  console.time('Done in')
 
-  for (let item of index.items) {
-    if (item.name === 'Unsorted') continue
+  const playlists = parseIndex()
 
-    console.log(`Processing '${item.url}'...`)
-    let playlist = parsePlaylist(item.url)
-    items = items.concat(playlist.items)
-
-    if (config.debug) {
-      console.log(`Sorting channels...`)
-    }
-    playlist = sortChannels(playlist)
-
-    if (config.debug) {
-      console.log(`Removing duplicates...`)
-    }
-    playlist = removeDuplicates(playlist)
-
-    if (config.epg) {
-      const tvgUrl = playlist.header.attrs['x-tvg-url']
-      if (tvgUrl) {
-        if (config.debug) {
-          console.log(`Loading EPG from '${tvgUrl}'...`)
-        }
-        const epg = await loadEPG(tvgUrl)
-        if (config.debug) {
-          console.log(`Adding the missing data from EPG...`)
-        }
-        playlist = addDataFromEPG(playlist, epg)
-      } else {
-        if (config.debug) {
-          console.log(`EPG source is not found`)
-        }
-      }
-    }
-
-    updatePlaylist(item.url, playlist)
+  for (const playlist of playlists) {
+    await loadPlaylist(playlist.url)
+      .then(sortChannels)
+      .then(filterChannels)
+      .then(detectResolution)
+      .then(savePlaylist)
+      .then(done)
   }
 
-  console.log(`Processing 'channels/unsorted.m3u'...`)
-  filterUnsorted()
-
-  console.log('Done.\n')
+  finish()
 }
 
 function parseIndex() {
-  const playlist = helper.parsePlaylist('index.m3u')
-  playlist.items = helper.filterPlaylists(playlist.items, config.country, config.exclude)
+  console.info(`\nParsing 'index.m3u'...`)
+  let playlists = parser.parseIndex()
+  playlists = utils
+    .filterPlaylists(playlists, config.country, config.exclude)
+    .filter(i => i.url !== 'channels/unsorted.m3u')
+  console.info(`Found ${playlists.length} playlist(s)\n`)
 
-  console.log(`Found ${playlist.items.length + 1} playlist(s)`)
+  return playlists
+}
+
+async function loadPlaylist(url) {
+  console.info(`Processing '${url}'...`)
+  return parser.parsePlaylist(url)
+}
+
+async function sortChannels(playlist) {
+  console.info(`  Sorting channels...`)
+  playlist.channels = utils.sortBy(playlist.channels, ['name', 'url'])
 
   return playlist
 }
 
-function parsePlaylist(url) {
-  const playlist = helper.parsePlaylist(url)
-
-  playlist.items = playlist.items.map(item => {
-    return helper.createChannel(item)
+async function filterChannels(playlist) {
+  console.info(`  Filtering channels...`)
+  const list = blacklist.map(i => i.toLowerCase())
+  playlist.channels = playlist.channels.filter(i => {
+    return !list.includes(i.name.toLowerCase())
   })
 
   return playlist
 }
 
-function sortChannels(playlist) {
-  const channels = JSON.stringify(playlist.items)
-  playlist.items = helper.sortBy(playlist.items, ['name', 'url'])
-
-  return playlist
-}
-
-function removeDuplicates(playlist) {
-  let buffer = {}
-  const channels = JSON.stringify(playlist.items)
-  playlist.items = playlist.items.filter(i => {
-    let result = typeof buffer[i.url] === 'undefined'
-
-    if (result) {
-      buffer[i.url] = true
-    } else {
-      if (config.debug) {
-        console.log(`Duplicate of '${i.name}' has been removed`)
-      }
-    }
-
-    return result
+async function detectResolution(playlist) {
+  if (!config.resolution) return playlist
+  console.log('  Detecting resolution...')
+  const bar = new ProgressBar('    Progress: [:bar] :current/:total (:percent) ', {
+    total: playlist.channels.length
   })
+  const results = []
+  for (const channel of playlist.channels) {
+    bar.tick()
+    if (!channel.resolution.height) {
+      const CancelToken = axios.CancelToken
+      const source = CancelToken.source()
+      const timeout = setTimeout(() => {
+        source.cancel()
+      }, config.timeout)
+
+      const response = await instance
+        .get(channel.url, { cancelToken: source.token })
+        .then(res => {
+          clearTimeout(timeout)
+
+          return res
+        })
+        .then(utils.sleep(config.delay))
+        .catch(err => {
+          clearTimeout(timeout)
+        })
+
+      if (response && response.status === 200) {
+        if (/^#EXTM3U/.test(response.data)) {
+          const resolution = parseResolution(response.data)
+          if (resolution) {
+            channel.resolution = resolution
+          }
+        }
+      }
+    }
+
+    results.push(channel)
+  }
+
+  playlist.channels = results
 
   return playlist
 }
 
-async function loadEPG(url) {
-  try {
-    return await helper.parseEPG(url)
-  } catch (err) {
-    console.error(`Error: could not load '${url}'`)
-    return
-  }
+function parseResolution(string) {
+  const regex = /RESOLUTION=(\d+)x(\d+)/gm
+  const match = string.matchAll(regex)
+  const arr = Array.from(match).map(m => ({
+    width: parseInt(m[1]),
+    height: parseInt(m[2])
+  }))
+
+  return arr.length
+    ? arr.reduce(function (prev, current) {
+        return prev.height > current.height ? prev : current
+      })
+    : undefined
 }
 
-function addDataFromEPG(playlist, epg) {
-  if (!epg) return playlist
+async function savePlaylist(playlist) {
+  const original = utils.readFile(playlist.url)
+  const output = playlist.toString()
 
-  for (let channel of playlist.items) {
-    if (!channel.tvg.id) continue
-
-    const epgItem = epg.channels[channel.tvg.id]
-
-    if (!epgItem) continue
-
-    if (!channel.tvg.name && epgItem.name.length) {
-      channel.tvg.name = epgItem.name[0].value
-      playlist.changed = true
-      if (config.debug) {
-        console.log(`Added tvg-name '${channel.tvg.name}' to '${channel.name}'`)
-      }
-    }
-
-    if (!channel.language.length && epgItem.name.length && epgItem.name[0].lang) {
-      channel.setLanguage(epgItem.name[0].lang)
-      playlist.changed = true
-      if (config.debug) {
-        console.log(`Added tvg-language '${epgItem.name[0].lang}' to '${channel.name}'`)
-      }
-    }
-
-    if (!channel.logo && epgItem.icon.length) {
-      channel.logo = epgItem.icon[0]
-      playlist.changed = true
-      if (config.debug) {
-        console.log(`Added tvg-logo '${channel.logo}' to '${channel.name}'`)
-      }
-    }
+  if (original === output) {
+    console.info(`No changes have been made.`)
+    return false
+  } else {
+    utils.createFile(playlist.url, output)
+    console.info(`Playlist has been updated.`)
   }
 
-  return playlist
+  return true
 }
 
-function updatePlaylist(filepath, playlist) {
-  helper.createFile(filepath, playlist.getHeader())
-  for (let channel of playlist.items) {
-    helper.appendToFile(filepath, channel.toShortString())
-  }
+async function done() {
+  console.info(` `)
 }
 
-function filterUnsorted() {
-  const urls = items.map(i => i.url)
-  const unsortedPlaylist = parsePlaylist('channels/unsorted.m3u')
-  const before = unsortedPlaylist.items.length
-  unsortedPlaylist.items = unsortedPlaylist.items.filter(i => !urls.includes(i.url))
-
-  if (before !== unsortedPlaylist.items.length) {
-    updatePlaylist('channels/unsorted.m3u', unsortedPlaylist)
-    updated++
-  }
+function finish() {
+  console.timeEnd('Done in')
 }
 
 main()
